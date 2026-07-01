@@ -350,10 +350,8 @@ function uid() { return 'c'+(Date.now()+Math.random()).toString(36).replace('.',
 // ═══════════════════════════════════════════════════════════
 //  PRICE FETCH  — uses tcgapi.dev (free, 100 req/day)
 //  Requires your free API key from tcgapi.dev/signup
-//  Works from any browser — no Anthropic auth needed.
 // ═══════════════════════════════════════════════════════════
 
-// Maps HobbyVault game names to tcgapi.dev game slugs
 const GAME_SLUG = {
   'Pokémon':              'pokemon',
   'Yu-Gi-Oh!':            'yugioh',
@@ -363,30 +361,55 @@ const GAME_SLUG = {
   'Other':                null
 };
 
-async function fetchCardPrice(card, apiKey) {
-  if (!apiKey || !apiKey.trim()) {
-    throw new Error('NO_API_KEY');
+// Lightweight connectivity check — pings a reliable public endpoint
+async function isOnline() {
+  try {
+    const r = await fetch('https://api.tcgapi.dev', { method: 'HEAD', mode: 'no-cors' });
+    return true; // no-cors always returns opaque — reaching here means network is up
+  } catch(e) {
+    return false;
   }
-  const game = GAME_SLUG[card.game];
-  // Build search query: card name + set for precision
-  const q = encodeURIComponent(card.name + ' ' + card.set);
-  const gameParam = game ? '&game=' + game : '';
-  const url = 'https://api.tcgapi.dev/v1/search?q=' + q + gameParam + '&limit=5';
+}
 
-  const res = await fetch(url, {
-    headers: { 'X-API-Key': apiKey.trim() }
-  });
+async function fetchCardPrice(card, apiKey) {
+  if (!apiKey || !apiKey.trim()) throw new Error('NO_API_KEY');
 
-  if (res.status === 401) throw new Error('INVALID_KEY');
+  const game     = GAME_SLUG[card.game];
+  const q        = encodeURIComponent(card.name + ' ' + card.set);
+  const gameParam= game ? '&game=' + game : '';
+  const url      = 'https://api.tcgapi.dev/v1/search?q=' + q + gameParam + '&limit=5';
+
+  let res;
+  try {
+    res = await fetch(url, { headers: { 'X-API-Key': apiKey.trim() } });
+  } catch(networkErr) {
+    // fetch() itself threw — true network failure, not an API error
+    const online = await isOnline();
+    throw new Error(online ? 'FETCH_BLOCKED' : 'OFFLINE');
+  }
+
+  // HTTP-level errors
+  if (res.status === 401 || res.status === 403) throw new Error('INVALID_KEY');
   if (res.status === 429) throw new Error('RATE_LIMITED');
   if (res.status === 402) throw new Error('QUOTA_EXCEEDED');
-  if (!res.ok) throw new Error('HTTP_' + res.status);
+  if (res.status === 404) return null; // card simply not found
+  if (!res.ok) {
+    // Try to pull a message from the response body for better diagnostics
+    let body = '';
+    try { const j = await res.json(); body = j.message || j.error || ''; } catch(e) {}
+    throw new Error('HTTP_' + res.status + (body ? ': ' + body : ''));
+  }
 
-  const data = await res.json();
+  let data;
+  try {
+    data = await res.json();
+  } catch(parseErr) {
+    throw new Error('BAD_JSON');
+  }
+
   if (!data.data || data.data.length === 0) return null;
 
-  // Find best match: prefer exact card number match, then name match
-  const results = data.data;
+  const results  = data.data;
   const numMatch = card.number
     ? results.find(r => (r.number||'').toLowerCase() === card.number.toLowerCase())
     : null;
@@ -550,17 +573,16 @@ function App() {
         showToast('No price found — check card name and set spelling.');
       }
     } catch(err) {
-      const code = err && err.message ? err.message : '';
-      if (code === 'NO_API_KEY')       { setShowKeyModal(true); }
-      else if (code === 'INVALID_KEY') { showToast('Invalid API key — click the key icon to update it.'); setShowKeyModal(true); }
-      else if (code === 'RATE_LIMITED'){ showToast('Rate limited (100/day free). Wait or upgrade at tcgapi.dev.'); }
-      else if (code === 'QUOTA_EXCEEDED'){showToast('Daily quota reached. Resets at midnight UTC.');}
-      else if (code.startsWith('HTTP_')){ showToast('Server error (' + code + '). Try again shortly.'); }
-      else if (code.includes('fetch') || code.includes('Failed') || code.includes('network')) {
-        showToast('No internet connection — check your network and retry.');
-      } else {
-        showToast('Price fetch failed: ' + (code.slice(0,80) || 'unknown error'));
-      }
+      const code = err && err.message ? err.message : 'UNKNOWN';
+      if      (code === 'NO_API_KEY')    { setShowKeyModal(true); }
+      else if (code === 'OFFLINE')       { showToast('No internet connection — check your network and retry.'); }
+      else if (code === 'FETCH_BLOCKED') { showToast('Request blocked — your browser or network is preventing the API call. Try disabling any VPN or firewall.'); }
+      else if (code === 'INVALID_KEY')   { showToast('Invalid API key — open "API key" in the top bar and re-enter your key from tcgapi.dev.'); setShowKeyModal(true); }
+      else if (code === 'RATE_LIMITED')  { showToast('Rate limited — free tier allows 100 lookups/day. Try again tomorrow or upgrade at tcgapi.dev.'); }
+      else if (code === 'QUOTA_EXCEEDED'){ showToast('Daily quota reached — resets at midnight UTC.'); }
+      else if (code === 'BAD_JSON')      { showToast('Unexpected response from pricing API — try again in a moment.'); }
+      else if (code.startsWith('HTTP_')) { showToast('API error: ' + code + ' — try again shortly.'); }
+      else                               { showToast('Price fetch failed: ' + code.slice(0, 120)); }
     }
     setLoadingPrices(p => ({...p, [card.id]: false}));
   }
