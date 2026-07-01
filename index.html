@@ -348,74 +348,25 @@ const GAME_DOT = {
 function uid() { return 'c'+(Date.now()+Math.random()).toString(36).replace('.',''); }
 
 // ═══════════════════════════════════════════════════════════
-//  PRICE FETCH  — uses tcgapi.dev (free, 100 req/day)
-//  Requires your free API key from tcgapi.dev/signup
+//  PRICE LOOKUP — builds TCGplayer search URLs
+//  No API, no auth, no network calls. Opens TCGplayer in a
+//  new tab so you can read the price and enter it manually.
 // ═══════════════════════════════════════════════════════════
 
-const GAME_SLUG = {
+// Maps game names to TCGplayer category slugs
+const GAME_TCG_CAT = {
   'Pokémon':              'pokemon',
   'Yu-Gi-Oh!':            'yugioh',
   'Magic: The Gathering': 'magic',
-  'Lorcana':              'lorcana',
-  'One Piece':            'one-piece',
-  'Other':                null
+  'Lorcana':              'disney-lorcana',
+  'One Piece':            'one-piece-card-game',
+  'Other':                'all'
 };
 
-// Lightweight connectivity check — pings a reliable public endpoint
-async function isOnline() {
-  try {
-    const r = await fetch('https://api.tcgapi.dev', { method: 'HEAD', mode: 'no-cors' });
-    return true; // no-cors always returns opaque — reaching here means network is up
-  } catch(e) {
-    return false;
-  }
-}
-
-async function fetchCardPrice(card, apiKey) {
-  if (!apiKey || !apiKey.trim()) throw new Error('NO_API_KEY');
-
-  const game     = GAME_SLUG[card.game];
-  const q        = encodeURIComponent(card.name + ' ' + card.set);
-  const gameParam= game ? '&game=' + game : '';
-  const url      = 'https://api.tcgapi.dev/v1/search?q=' + q + gameParam + '&limit=5';
-
-  let res;
-  try {
-    res = await fetch(url, { headers: { 'X-API-Key': apiKey.trim() } });
-  } catch(networkErr) {
-    // fetch() itself threw — true network failure, not an API error
-    const online = await isOnline();
-    throw new Error(online ? 'FETCH_BLOCKED' : 'OFFLINE');
-  }
-
-  // HTTP-level errors
-  if (res.status === 401 || res.status === 403) throw new Error('INVALID_KEY');
-  if (res.status === 429) throw new Error('RATE_LIMITED');
-  if (res.status === 402) throw new Error('QUOTA_EXCEEDED');
-  if (res.status === 404) return null; // card simply not found
-  if (!res.ok) {
-    // Try to pull a message from the response body for better diagnostics
-    let body = '';
-    try { const j = await res.json(); body = j.message || j.error || ''; } catch(e) {}
-    throw new Error('HTTP_' + res.status + (body ? ': ' + body : ''));
-  }
-
-  let data;
-  try {
-    data = await res.json();
-  } catch(parseErr) {
-    throw new Error('BAD_JSON');
-  }
-
-  if (!data.data || data.data.length === 0) return null;
-
-  const results  = data.data;
-  const numMatch = card.number
-    ? results.find(r => (r.number||'').toLowerCase() === card.number.toLowerCase())
-    : null;
-  const best = numMatch || results[0];
-
-  return typeof best.price === 'number' ? best.price : null;
+function tcgplayerUrl(card) {
+  const cat = GAME_TCG_CAT[card.game] || 'all';
+  const q   = encodeURIComponent(card.name + ' ' + card.set);
+  return 'https://www.tcgplayer.com/search/' + cat + '/product?q=' + q + '&view=grid';
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -431,24 +382,12 @@ function App() {
   const [cart, setCart]             = useState([]);
   const [modal, setModal]           = useState(null); // 'add'|'edit'|'checkout'
   const [editTarget, setEditTarget] = useState(null);
-  const [loadingPrices, setLoadingPrices] = useState({});
   const [toast, setToast] = useState(null);
   const toastTimer = useRef(null);
 
   const [form, setForm] = useState({
     name:'', game:'Pokémon', set:'', number:'', condition:'NM', qty:1
   });
-  const [apiKey, setApiKey] = useState(() => localStorage.getItem('hv_tcgapi_key') || '');
-  const [showKeyModal, setShowKeyModal] = useState(false);
-
-  function saveApiKey(k) {
-    const trimmed = k.trim();
-    setApiKey(trimmed);
-    if (trimmed) localStorage.setItem('hv_tcgapi_key', trimmed);
-    else localStorage.removeItem('hv_tcgapi_key');
-    setShowKeyModal(false);
-    showToast(trimmed ? 'API key saved. You can now fetch prices.' : 'API key cleared.');
-  }
 
   // Wrappers that also persist to localStorage
   function setInv(fn) {
@@ -558,41 +497,17 @@ function App() {
     return s + (card?.price||0) * i.qty;
   }, 0);
 
-  // ── Price fetching ──
-  async function refreshPrice(card, e) {
-    if (e) e.stopPropagation();
-    if (!apiKey) { setShowKeyModal(true); return; }
-    setLoadingPrices(p => ({...p, [card.id]: true}));
-    try {
-      const price = await fetchCardPrice(card, apiKey);
-      if (price !== null) {
-        setInv(prev => prev.map(c => c.id === card.id
-          ? {...c, price, priceTs: Date.now()} : c));
-        showToast(card.name + ' — $' + price.toFixed(2));
-      } else {
-        showToast('No price found — check card name and set spelling.');
-      }
-    } catch(err) {
-      const code = err && err.message ? err.message : 'UNKNOWN';
-      if      (code === 'NO_API_KEY')    { setShowKeyModal(true); }
-      else if (code === 'OFFLINE')       { showToast('No internet connection — check your network and retry.'); }
-      else if (code === 'FETCH_BLOCKED') { showToast('Request blocked — your browser or network is preventing the API call. Try disabling any VPN or firewall.'); }
-      else if (code === 'INVALID_KEY')   { showToast('Invalid API key — open "API key" in the top bar and re-enter your key from tcgapi.dev.'); setShowKeyModal(true); }
-      else if (code === 'RATE_LIMITED')  { showToast('Rate limited — free tier allows 100 lookups/day. Try again tomorrow or upgrade at tcgapi.dev.'); }
-      else if (code === 'QUOTA_EXCEEDED'){ showToast('Daily quota reached — resets at midnight UTC.'); }
-      else if (code === 'BAD_JSON')      { showToast('Unexpected response from pricing API — try again in a moment.'); }
-      else if (code.startsWith('HTTP_')) { showToast('API error: ' + code + ' — try again shortly.'); }
-      else                               { showToast('Price fetch failed: ' + code.slice(0, 120)); }
-    }
-    setLoadingPrices(p => ({...p, [card.id]: false}));
+  // ── Price entry — saves a manually entered price for a card ──
+  function setPrice(id, value) {
+    const num = parseFloat(value);
+    if (isNaN(num) || num < 0) return;
+    setInv(prev => prev.map(c => c.id === id
+      ? {...c, price: Math.round(num * 100) / 100, priceTs: Date.now()} : c));
   }
 
-  async function refreshAllVisible() {
-    const unpriced = filtered.filter(c => c.price === null && !loadingPrices[c.id]);
-    if (!unpriced.length) { showToast('All visible cards already priced.'); return; }
-    showToast(`Fetching ${unpriced.length} price${unpriced.length>1?'s':''}…`);
-    for (const card of unpriced) await refreshPrice(card);
-    showToast('Prices updated.');
+  function clearPrice(id) {
+    setInv(prev => prev.map(c => c.id === id
+      ? {...c, price: null, priceTs: 0} : c));
   }
 
   // ── Quantity ──
@@ -718,16 +633,6 @@ function App() {
       React.createElement('div', {className:'topbar-right'},
         React.createElement('button', {className:'btn sm', onClick:openAdd},
           React.createElement('i',{className:'ti ti-plus'}), 'Add card'),
-        React.createElement('button', {className:'btn sm', onClick:refreshAllVisible},
-          React.createElement('i',{className:'ti ti-refresh'}), 'Refresh prices'),
-        React.createElement('button', {
-          className:'btn sm' + (apiKey ? '' : ' danger'),
-          onClick:()=>setShowKeyModal(true),
-          title: apiKey ? 'API key configured — click to change' : 'No API key set — click to add one'
-        },
-          React.createElement('i',{className:'ti ti-key'}),
-          apiKey ? 'API key ✓' : 'Set API key'
-        ),
         React.createElement('button', {className:'btn sm', onClick:exportData, title:'Download a backup of all your inventory and orders as a .json file'},
           React.createElement('i',{className:'ti ti-download'}), 'Export'),
         React.createElement('button', {className:'btn sm', onClick:()=>importRef.current&&importRef.current.click(), title:'Restore inventory from a previously exported .json backup'},
@@ -811,7 +716,7 @@ function App() {
       React.createElement('div', {className:'content'},
         view==='inventory' && React.createElement(InventoryView, {
           filtered, gameFilter, setFilter, setSetFilter,
-          loadingPrices, refreshPrice, adjustQty, cartAdd,
+          setPrice, clearPrice, adjustQty, cartAdd,
           openEdit, deleteCard, cart, inv, hl, GAME_KEY
         }),
         view==='orders'    && React.createElement(OrdersView, {orders}),
@@ -901,77 +806,15 @@ function App() {
       )
     ),
 
-    // API Key modal
-    showKeyModal && React.createElement('div',{className:'overlay',onClick:()=>setShowKeyModal(false)},
-      React.createElement(ApiKeyModal,{
-        currentKey:apiKey, onSave:saveApiKey,
-        onClose:()=>setShowKeyModal(false)
-      })
-    ),
-
     // Toast notification
     toast && React.createElement('div',{className:'toast'}, toast)
   );
 }
 
 // ═══════════════════════════════════════════════════════════
-//  API KEY MODAL
-// ═══════════════════════════════════════════════════════════
-function ApiKeyModal({currentKey, onSave, onClose}) {
-  const [val, setVal] = React.useState(currentKey || '');
-  return React.createElement('div',{className:'overlay',onClick:onClose},
-    React.createElement('div',{className:'modal',style:{width:400},onClick:e=>e.stopPropagation()},
-      React.createElement('div',{className:'modal-title'},
-        React.createElement('i',{className:'ti ti-key',style:{marginRight:8}}),
-        'TCG API key'
-      ),
-      React.createElement('div',{style:{fontSize:13,color:'var(--text-muted)',marginBottom:16,lineHeight:1.6}},
-        'Prices are fetched from ',
-        React.createElement('a',{href:'https://tcgapi.dev',target:'_blank',style:{color:'var(--accent-text)'},onClick:e=>e.stopPropagation()},'tcgapi.dev'),
-        ' — a free pricing API for trading cards. The free tier gives you 100 price lookups per day with no credit card required.',
-        React.createElement('br'),React.createElement('br'),
-        'To get your free key:',
-        React.createElement('ol',{style:{margin:'8px 0 0 16px',display:'flex',flexDirection:'column',gap:4}},
-          React.createElement('li',null,'Go to ',
-            React.createElement('a',{href:'https://tcgapi.dev/signup',target:'_blank',style:{color:'var(--accent-text)'},onClick:e=>e.stopPropagation()},'tcgapi.dev/signup')),
-          React.createElement('li',null,'Create a free account (email + password, no card required)'),
-          React.createElement('li',null,'Copy your API key from the dashboard'),
-          React.createElement('li',null,'Paste it below and click Save')
-        )
-      ),
-      React.createElement('div',{className:'form-row'},
-        React.createElement('label',null,'Your API key'),
-        React.createElement('input',{
-          type:'text',
-          value:val,
-          onChange:e=>setVal(e.target.value),
-          placeholder:'e.g. tcgapi_xxxxxxxxxxxxxxxx',
-          style:{fontFamily:'var(--mono)',fontSize:12}
-        })
-      ),
-      currentKey && React.createElement('div',{
-        style:{fontSize:11,color:'var(--text-dim)',marginTop:-6,marginBottom:10}
-      },'Key ending in …' + currentKey.slice(-6) + ' is currently active.'),
-      React.createElement('div',{className:'form-actions'},
-        currentKey && React.createElement('button',{
-          className:'btn danger',style:{marginRight:'auto'},
-          onClick:()=>onSave('')
-        },'Remove key'),
-        React.createElement('button',{className:'btn',onClick:onClose},'Cancel'),
-        React.createElement('button',{
-          className:'btn primary',
-          onClick:()=>onSave(val),
-          disabled:!val.trim() && !currentKey
-        },'Save key')
-      )
-    )
-  );
-}
-
-// ═══════════════════════════════════════════════════════════
 //  INVENTORY VIEW
 // ═══════════════════════════════════════════════════════════
-function InventoryView({filtered, gameFilter, setFilter, setSetFilter, loadingPrices, refreshPrice, adjustQty, cartAdd, openEdit, deleteCard, cart, inv, hl, GAME_KEY}) {
+function InventoryView({filtered, gameFilter, setFilter, setSetFilter, setPrice, clearPrice, adjustQty, cartAdd, openEdit, deleteCard, cart, inv, hl, GAME_KEY}) {
   const title = gameFilter==='All' ? 'All cards'
     : setFilter==='All' ? gameFilter
     : `${gameFilter} — ${setFilter}`;
@@ -991,7 +834,8 @@ function InventoryView({filtered, gameFilter, setFilter, setSetFilter, loadingPr
       : React.createElement('div',{className:'cards-grid'},
           filtered.map(card =>
             React.createElement(CardTile,{
-              key:card.id, card, loadingPrices, refreshPrice,
+              key:card.id, card,
+              setPrice, clearPrice,
               adjustQty, cartAdd, openEdit, deleteCard, cart, hl, GAME_KEY
             })
           )
@@ -1002,19 +846,44 @@ function InventoryView({filtered, gameFilter, setFilter, setSetFilter, loadingPr
 // ═══════════════════════════════════════════════════════════
 //  CARD TILE
 // ═══════════════════════════════════════════════════════════
-function CardTile({card, loadingPrices, refreshPrice, adjustQty, cartAdd, openEdit, deleteCard, cart, hl, GAME_KEY}) {
-  const inCart   = cart.find(i => i.cardId === card.id);
-  const isLoading= loadingPrices[card.id];
-  const gk       = GAME_KEY[card.game] || 'other';
-  const ageStr   = card.priceTs
+function CardTile({card, setPrice, clearPrice, adjustQty, cartAdd, openEdit, deleteCard, cart, hl, GAME_KEY}) {
+  const inCart  = cart.find(i => i.cardId === card.id);
+  const gk      = GAME_KEY[card.game] || 'other';
+  const ageStr  = card.priceTs
     ? (()=>{const m=Math.floor((Date.now()-card.priceTs)/60000); return m<60?`${m}m ago`:m<1440?`${Math.floor(m/60)}h ago`:`${Math.floor(m/1440)}d ago`;})()
     : null;
 
+  // Local state for the inline price input
+  const [editing, setEditing]   = React.useState(false);
+  const [inputVal, setInputVal] = React.useState('');
+  const inputRef = React.useRef(null);
+
+  function startEdit(e) {
+    e.stopPropagation();
+    setInputVal(card.price !== null ? card.price.toFixed(2) : '');
+    setEditing(true);
+    setTimeout(() => inputRef.current && inputRef.current.focus(), 30);
+  }
+
+  function commitPrice(e) {
+    e.stopPropagation();
+    const v = parseFloat(inputVal);
+    if (!isNaN(v) && v >= 0) setPrice(card.id, v);
+    setEditing(false);
+  }
+
+  function handleKey(e) {
+    if (e.key === 'Enter')  commitPrice(e);
+    if (e.key === 'Escape') { setEditing(false); }
+  }
+
+  const tcgUrl = tcgplayerUrl(card);
+
   return React.createElement('div',{className:'card-tile'+(inCart?' in-cart':'')},
-    React.createElement('div',{className:`card-stripe stripe-${gk}`}),
+    React.createElement('div',{className:'card-stripe stripe-'+gk}),
     React.createElement('div',{className:'card-body'},
 
-      // Name + action buttons
+      // Name + edit/delete buttons
       React.createElement('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'flex-start',gap:4,marginBottom:3}},
         React.createElement('div',{className:'card-name'}, hl(card.name)),
         React.createElement('div',{style:{display:'flex',gap:3,flexShrink:0}},
@@ -1030,49 +899,91 @@ function CardTile({card, loadingPrices, refreshPrice, adjustQty, cartAdd, openEd
 
       // Badges
       React.createElement('div',{className:'card-badges'},
-        React.createElement('span',{className:`badge badge-${gk}`}, card.game),
+        React.createElement('span',{className:'badge badge-'+gk}, card.game),
         React.createElement('span',{className:'badge badge-cond'}, card.condition),
         card.number && React.createElement('span',{className:'badge badge-num'}, hl(card.number))
       ),
 
-      // Divider + price + qty
       React.createElement('div',{className:'card-bottom'},
 
-        // Price row
+        // Price display / inline editor
         React.createElement('div',{className:'card-price-row'},
-          isLoading
-            ? React.createElement('span',{className:'card-price loading'},'Fetching price…')
-            : card.price !== null
-              ? React.createElement('div',null,
-                  React.createElement('div',{className:'card-price'},'$'+card.price.toFixed(2)),
-                  ageStr && React.createElement('div',{className:'price-ts'},`Updated ${ageStr}`)
+          editing
+            ? React.createElement('div',{style:{display:'flex',alignItems:'center',gap:4}},
+                React.createElement('span',{style:{fontSize:13,color:'var(--text-muted)'}},'$'),
+                React.createElement('input',{
+                  ref: inputRef,
+                  type:'number', min:'0', step:'0.01',
+                  value: inputVal,
+                  onChange: e=>setInputVal(e.target.value),
+                  onKeyDown: handleKey,
+                  onClick: e=>e.stopPropagation(),
+                  style:{width:80, fontFamily:'var(--mono)', fontSize:13, padding:'3px 6px'}
+                }),
+                React.createElement('button',{className:'btn sm primary',onClick:commitPrice},'Save'),
+                React.createElement('button',{className:'btn sm',onClick:e=>{e.stopPropagation();setEditing(false)}},'✕')
+              )
+            : React.createElement('div',{style:{display:'flex',alignItems:'center',gap:8}},
+                card.price !== null
+                  ? React.createElement('div',null,
+                      React.createElement('span',{
+                        className:'card-price',
+                        title:'Click to edit price',
+                        style:{cursor:'pointer'},
+                        onClick:startEdit
+                      },'$'+card.price.toFixed(2)),
+                      ageStr && React.createElement('div',{className:'price-ts'},'Updated '+ageStr)
+                    )
+                  : React.createElement('span',{className:'card-price no-price'},'No price set'),
+                React.createElement('button',{
+                  className:'btn sm',
+                  style:{fontSize:11,padding:'3px 7px'},
+                  title: card.price !== null ? 'Edit price' : 'Enter price',
+                  onClick: startEdit
+                },
+                  React.createElement('i',{className:'ti ti-pencil',style:{fontSize:11}}),
+                  card.price !== null ? 'Edit' : 'Set price'
                 )
-              : React.createElement('span',{className:'card-price no-price'},'No price yet'),
-          card.price !== null && React.createElement('button',{
-            className:'btn sm' + (inCart?' primary':''),
+              ),
+
+          // Add to order button (only when priced)
+          !editing && card.price !== null && React.createElement('button',{
+            className:'btn sm'+(inCart?' primary':''),
             onClick:()=>cartAdd(card),
-            disabled:card.qty===0
-          }, inCart ? `In order (${inCart.qty})` : 'Add to order')
+            disabled:card.qty===0,
+            style:{marginLeft:'auto'}
+          }, inCart ? 'In order ('+inCart.qty+')' : 'Add to order')
         ),
 
-        // Get/refresh price button (when no price or want refresh)
-        React.createElement('div',{style:{display:'flex',alignItems:'center',justifyContent:'space-between',marginTop:6}},
-          // Qty controls
-          React.createElement('div',{className:'qty-row'},
-            React.createElement('button',{className:'qty-btn',onClick:()=>adjustQty(card.id,-1)},'−'),
-            React.createElement('span',{className:'qty-val'}, card.qty),
-            React.createElement('button',{className:'qty-btn',onClick:()=>adjustQty(card.id,+1)},'+'),
-            React.createElement('span',{className:'qty-label'},'in stock')
-          ),
-          React.createElement('button',{
-            className:'btn sm',
-            style:{fontSize:11,padding:'3px 7px'},
-            onClick:e=>refreshPrice(card,e),
-            disabled:isLoading
+        // TCGplayer lookup link
+        React.createElement('div',{style:{margin:'6px 0 8px'}},
+          React.createElement('a',{
+            href: tcgUrl,
+            target:'_blank',
+            rel:'noopener noreferrer',
+            style:{
+              fontSize:11, color:'var(--accent-text)',
+              textDecoration:'none', display:'inline-flex',
+              alignItems:'center', gap:3
+            }
           },
-            React.createElement('i',{className:'ti ti-refresh',style:{fontSize:11}}),
-            card.price===null ? 'Get price' : '↻'
+            React.createElement('i',{className:'ti ti-external-link',style:{fontSize:11}}),
+            'Look up on TCGplayer ↗'
           )
+        ),
+
+        // Qty controls
+        React.createElement('div',{style:{display:'flex',alignItems:'center',gap:6}},
+          React.createElement('button',{className:'qty-btn',onClick:()=>adjustQty(card.id,-1)},'−'),
+          React.createElement('span',{className:'qty-val'}, card.qty),
+          React.createElement('button',{className:'qty-btn',onClick:()=>adjustQty(card.id,+1)},'+'),
+          React.createElement('span',{className:'qty-label'},'in stock'),
+          card.price !== null && React.createElement('button',{
+            className:'btn icon sm',
+            title:'Clear price',
+            style:{marginLeft:'auto', opacity:0.5},
+            onClick:e=>{e.stopPropagation();clearPrice(card.id);}
+          }, React.createElement('i',{className:'ti ti-x',style:{fontSize:11}}))
         )
       )
     )
